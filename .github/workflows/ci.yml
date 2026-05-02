@@ -1,0 +1,249 @@
+name: test-pull-request
+
+run-name: "Deploy to NPROD VMSS"
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 'Targeted Environment'
+        required: true
+        default: 'usdev'
+        type: choice
+        options:
+          - 'usdev'
+          - 'usqa'
+          - 'usuat'
+          - 'eudev'
+          - 'euqa'
+          - 'euuat'
+      image_tag:
+        description: 'Image tag to deploy'
+        required: false
+        type: string
+permissions:
+  contents: read
+
+jobs:
+  update-tag-vmss:
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: self-hosted
+    outputs:
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+      branch_name: ${{ steps.update-files.outputs.branch_name }}
+      has_changes: ${{ steps.update-files.outputs.has_changes }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.ref_name }}
+      - name: Update values files with provided image tag
+        id: update-files
+        run: |
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          TARGET_ENV="${{ github.event.inputs.env }}"
+
+          # Parse REGION and ENVIRONMENT from the combined env input (e.g. "euqa").
+          # A separate 'region' input was intentionally avoided to keep the dispatch
+          # form simple — a single 'env' choice is less error-prone for operators.
+          # Known environment suffixes: dev, qa, uat, prod.
+          # Everything before the suffix becomes the region (e.g. "eu", "us", "apac").
+
+          REGION=""
+          ENVIRONMENT=""
+
+          # Try to match known environment suffixes
+          for env_suffix in dev qa uat prod; do
+            if [[ "$TARGET_ENV" == *"$env_suffix" ]]; then
+              ENVIRONMENT="$env_suffix"
+              REGION="${TARGET_ENV%$env_suffix}"
+              break
+            fi
+          done
+
+          # NOTE: REGION is written here for use later in this same step.
+          # It is written again below after validation to export it to
+          # subsequent steps via GITHUB_ENV (the first write is redundant
+          # and can be removed once the parsing block is confirmed stable).
+          echo "REGION=$REGION" >> $GITHUB_ENV
+
+          # Validate that we successfully parsed both region and environment
+          if [[ -z "$REGION" || -z "$ENVIRONMENT" ]]; then
+            echo "Failed to parse region and environment from: $TARGET_ENV"
+            echo "Expected format: [region][environment] where environment is one of: dev, qa, uat, prod"
+            echo "Examples: usdev, euqa, apacuat, cadev"
+            exit 1
+          fi
+
+          echo "Targeting Environment: $ENVIRONMENT, Region: $REGION (parsed from: $TARGET_ENV)"
+          echo "Updating VMSS terraform files with deployment parameters"
+          echo "REGION=$REGION" >> $GITHUB_ENV
+          echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+
+          file=$(find . -name "image.json")
+          if [ -n "$file" ]; then
+            echo "Processing $file"
+            if grep -q '"image_tag"' "$file"; then
+              sed -E "s/(\"image_tag\"\s*:\s*\")[^\"]*(\")/\1${IMAGE_TAG}\2/" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+            else
+              sed -i '$s/}/,\n"image_tag": "'${IMAGE_TAG}'"\n}/g' "$file"
+            fi
+            git add "$file"
+          else
+            echo "No image.json file found"
+          fi
+
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "GitHub Actions"
+
+          # Replace dots with hyphens for the branch name: Git branch names cannot
+          # safely contain dots, and some tooling (e.g. Terraform module sources)
+          # misinterprets dots in branch refs. The original tag is still used in
+          # commit messages and PR titles.
+          IMAGE_TAG="${IMAGE_TAG//./-}"
+          BRANCH_IMAGE_TAG="${IMAGE_TAG#NOD-}"
+          BRANCH_NAME="feature/123/${BRANCH_IMAGE_TAG}"
+          git checkout -b "$BRANCH_NAME"
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Deploy ${IMAGE_TAG} to ${ENVIRONMENT} environments"
+            git push origin $BRANCH_NAME
+            echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "No changes to commit."
+            git checkout "${{ github.ref_name }}"
+            git branch -D "$BRANCH_NAME"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Create Pull Request
+        id: create-pr
+        if: steps.update-files.outputs.has_changes == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGION: ${{ env.REGION }}
+          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+        run: |
+          TAG_NAME="${{ github.event.inputs.image_tag }}"
+          REGION="$REGION"
+
+          PR_TITLE="Deploy ${TAG_NAME} to ${ENVIRONMENT} in ${REGION}"
+
+          PR_BODY="Automated deployment of image tag ${TAG_NAME} to ${ENVIRONMENT} environment in region ${REGION}. This PR updates deployment values files and requires approval before merge."
+
+          PR_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
+            -d "$(jq -n \
+              --arg title \"${PR_TITLE}\" \
+              --arg body \"${PR_BODY}\" \
+              --arg head \"${{ steps.update-files.outputs.branch_name }}\" \
+              --arg base \"${{ github.ref_name }}\" \
+              '{title: $title, body: $body, head: $head, base: $base}')")
+
+          HTTP_CODE=$(echo "$PR_RESPONSE" | grep "HTTP_CODE" | cut -d: -f2)
+          RESPONSE_BODY=$(echo "$PR_RESPONSE" | sed '/HTTP_CODE/d')
+
+          if [ "$HTTP_CODE" != "201" ]; then
+            echo "Error creating PR. HTTP Status: ${HTTP_CODE}"
+            echo "Full Response: ${RESPONSE_BODY}"
+            exit 1
+          fi
+
+          PR_NUMBER=$(echo "$RESPONSE_BODY" | jq -r '.number')
+
+          echo "pr_number=${PR_NUMBER}" >> $GITHUB_OUTPUT
+          echo "Successfully created PR #${PR_NUMBER}"
+      - name: Wait for PR approval and merge
+        if: steps.update-files.outputs.has_changes == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGION: ${{ env.REGION }}
+        run: |
+          PR_NUMBER="${{ steps.create-pr.outputs.pr_number }}"
+
+          echo "PR #${PR_NUMBER} created. Waiting for code owner approval..."
+          echo "Please review and approve the PR at: https://github.com/${GITHUB_REPOSITORY}/pull/${PR_NUMBER}"
+
+          # Poll until the PR is merged, closed-without-merge, or the timeout
+          # is reached. Times are in seconds:
+          # MAX_WAIT_TIME = 1800 s = 30 minutes
+          # CHECK_INTERVAL = 30 s (GitHub API rate limit: 5000 req/hr for tokens)
+          # On timeout the step exits 1; the operator must manually merge the PR
+          # and re-run the workflow from the vmss job (or trigger a fresh run).
+          MAX_WAIT_TIME=1800
+          CHECK_INTERVAL=30
+          elapsed=0
+
+          while [ $elapsed -lt $MAX_WAIT_TIME ]; do
+            # NOTE: The loop makes up to 3 separate GitHub API calls per iteration
+            # (PR state → merged flag → mergeable_state). This is intentional to
+            # keep each branch readable, but a future optimisation could fetch the
+            # full PR object once per tick and parse all fields from a single response.
+            PR_STATUS=$(curl -s \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" | jq -r '.state')
+
+            if [ "$PR_STATUS" = "closed" ]; then
+              IS_MERGED=$(curl -s \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" | jq -r '.merged')
+
+              if [ "$IS_MERGED" = "true" ]; then
+                echo "PR #${PR_NUMBER} has been approved and merged successfully!"
+                git push origin --delete "${{ steps.update-files.outputs.branch_name }}" 2>/dev/null || echo "Branch already deleted"
+                exit 0
+              else
+                echo "PR #${PR_NUMBER} was closed without merging"
+                exit 1
+              fi
+            fi
+
+            MERGEABLE=$(curl -s \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" | jq -r '.mergeable_state')
+
+            echo "PR status: ${PR_STATUS}, Mergeable state: ${MERGEABLE} (waited ${elapsed}s/${MAX_WAIT_TIME}s)"
+
+            if [ "$MERGEABLE" = "clean" ]; then
+              echo "PR is approved and ready to merge. Merging now..."
+
+              MERGE_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X PUT \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/merge" \
+                -d '{
+                  "commit_title": "Merge deployment PR for ${{ github.event.inputs.image_tag }}",
+                  "commit_message": "Auto-merged deployment changes for ${{ env.REGION }}",
+                  "merge_method": "squash"
+                }')
+
+              HTTP_CODE=$(echo "$MERGE_RESPONSE" | grep "HTTP_CODE" | cut -d: -f2)
+
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "PR #${PR_NUMBER} merged successfully!"
+                sleep 2
+                git push origin --delete "${{ steps.update-files.outputs.branch_name }}" 2>/dev/null || echo "Branch already deleted"
+                exit 0
+              else
+                echo "Failed to merge PR. HTTP Code: ${HTTP_CODE}"
+                echo "Response: $(echo "$MERGE_RESPONSE" | sed '/HTTP_CODE/d')"
+              fi
+            fi
+
+            sleep $CHECK_INTERVAL
+            elapsed=$((elapsed + CHECK_INTERVAL))
+          done
+
+          echo "Timeout: PR was not approved within ${MAX_WAIT_TIME} seconds"
+          echo "Please manually merge PR #${PR_NUMBER} and re-run the deployment workflow"
+          exit 1
